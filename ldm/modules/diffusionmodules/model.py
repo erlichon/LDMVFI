@@ -8,6 +8,11 @@ from ldm.modules.attention import LinearAttention, SpatialCrossAttentionWithPosE
 from ldm.modules.maxvit import SpatialCrossAttentionWithMax, MaxAttentionBlock
 
 from cupy_module import dsepconv
+# adding imports so new FlowDecoderWithResidual of BBDM will work
+import sys
+sys.path.insert(-1, "../ConsecutiveBrownianBridge")
+from VFI.archs.VFIformer_arch import VFIformer
+from VFI.archs.warplayer import warp
 
 
 def get_timestep_embedding(timesteps, embedding_dim):
@@ -349,69 +354,38 @@ class FlowEncoder(FIEncoder):
             **ignore_kwargs
         )
 
-
-
 class FlowDecoderWithResidual(nn.Module):
     def __init__(self, *, ch, out_ch, ch_mult=(1,2,4,8), num_res_blocks,
                  attn_resolutions, dropout=0.0, resamp_with_conv=True, in_channels,
                  resolution, z_channels, give_pre_end=False, tanh_out=False, use_linear_attn=False,
-                 attn_type="vanilla", num_head_channels=32, num_heads=1, cond_type=None,
+                 attn_type="vanilla", num_head_channels=32, num_heads=1, cond_type=None,load_VFI = None,
                  **ignorekwargs):
         super().__init__()
-
-        def KernelHead(c_in):
-            return torch.nn.Sequential(
-                    torch.nn.Conv2d(in_channels=c_in, out_channels=64, kernel_size=3, stride=1, padding=1),
-                    torch.nn.ReLU(inplace=False),
-                    torch.nn.Conv2d(in_channels=64, out_channels=32, kernel_size=3, stride=1, padding=1),
-                    torch.nn.ReLU(inplace=False),
-                    torch.nn.Conv2d(in_channels=32, out_channels=5, kernel_size=3, stride=1, padding=1),
-                    torch.nn.ReLU(inplace=False),
-                    # torch.nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True),
-                    torch.nn.Conv2d(in_channels=5, out_channels=5, kernel_size=3, stride=1, padding=1)
-                )
-        # end
-
-        def OffsetHead(c_in):
-            return torch.nn.Sequential(
-                    torch.nn.Conv2d(in_channels=c_in, out_channels=64, kernel_size=3, stride=1, padding=1),
-                    torch.nn.ReLU(inplace=False),
-                    torch.nn.Conv2d(in_channels=64, out_channels=32, kernel_size=3, stride=1, padding=1),
-                    torch.nn.ReLU(inplace=False),
-                    torch.nn.Conv2d(in_channels=32, out_channels=5 ** 2, kernel_size=3, stride=1, padding=1),
-                    torch.nn.ReLU(inplace=False),
-                    # torch.nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True),
-                    torch.nn.Conv2d(in_channels=5 ** 2, out_channels=5 ** 2, kernel_size=3, stride=1, padding=1)
-                )
-
 
         def MaskHead(c_in):
             return torch.nn.Sequential(
                     torch.nn.Conv2d(in_channels=c_in, out_channels=64, kernel_size=3, stride=1, padding=1),
+                    Normalize(64,num_groups = 16),
                     torch.nn.ReLU(inplace=False),
                     torch.nn.Conv2d(in_channels=64, out_channels=32, kernel_size=3, stride=1, padding=1),
+                    Normalize(32,num_groups = 8),
                     torch.nn.ReLU(inplace=False),
-                    torch.nn.Conv2d(in_channels=32, out_channels=5 ** 2, kernel_size=3, stride=1, padding=1),
-                    torch.nn.ReLU(inplace=False),
-                    # torch.nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True),
-                    torch.nn.Conv2d(in_channels=5 ** 2, out_channels=5 ** 2, kernel_size=3,
-                             stride=1, padding=1),
+                    torch.nn.Conv2d(in_channels=32, out_channels=1, kernel_size=3, stride=1, padding=1),
                     torch.nn.Sigmoid()
                 )
-
         def ResidualHead(c_in):
             return torch.nn.Sequential(
                     torch.nn.Conv2d(in_channels=c_in, out_channels=64, kernel_size=3, stride=1, padding=1),
+                    Normalize(64,num_groups = 16),
                     torch.nn.ReLU(inplace=False),
                     torch.nn.Conv2d(in_channels=64, out_channels=32, kernel_size=3, stride=1, padding=1),
+                    Normalize(32,num_groups = 8),
                     torch.nn.ReLU(inplace=False),
                     torch.nn.Conv2d(in_channels=32, out_channels=3, kernel_size=3, stride=1, padding=1),
-                    torch.nn.ReLU(inplace=False),
-                    # torch.nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True),
-                    torch.nn.Conv2d(in_channels=3, out_channels=3, kernel_size=3, stride=1, padding=1)
+                    torch.nn.Sigmoid()
                 )
         
-
+        self.load_VFI = load_VFI
         self.ch = ch # 128
         self.temb_ch = 0
         self.num_resolutions = len(ch_mult) # 3
@@ -420,6 +394,17 @@ class FlowDecoderWithResidual(nn.Module):
         self.in_channels = in_channels # 3
         self.give_pre_end = give_pre_end # False
         self.tanh_out = tanh_out # False
+
+        vfi = VFIformer()
+        if not self.load_VFI is None:
+            print(f'loading VFIformer from {self.load_VFI}')
+            vfi.load_state_dict(torch.load(self.load_VFI))
+        self.flownet = vfi.flownet
+        self.refinenet = vfi.refinenet
+        for p in self.flownet.parameters():
+            p.requires_grad = False
+        for p in self.refinenet.parameters():
+            p.requires_grad = False
 
         # compute in_ch_mult, block_in and curr_res at lowest res
         in_ch_mult = (1,)+tuple(ch_mult) # (1,1,2,4)
@@ -505,29 +490,41 @@ class FlowDecoderWithResidual(nn.Module):
                                         kernel_size=3,
                                         stride=1,
                                         padding=1)
-        self.moduleAlpha1 = OffsetHead(c_in=block_in)
-        self.moduleAlpha2 = OffsetHead(c_in=block_in)
-        self.moduleBeta1 = OffsetHead(c_in=block_in)
-        self.moduleBeta2 = OffsetHead(c_in=block_in)
-        self.moduleKernelHorizontal1 = KernelHead(c_in=block_in)
-        self.moduleKernelHorizontal2 = KernelHead(c_in=block_in)
-        self.moduleKernelVertical1 = KernelHead(c_in=block_in)
-        self.moduleKernelVertical2 = KernelHead(c_in=block_in)
+
         self.moduleMask = MaskHead(c_in=block_in)
         self.moduleResidual = ResidualHead(c_in=block_in)
-        self.modulePad = torch.nn.ReplicationPad2d([2, 2, 2, 2])
 
     def forward(self, z, cond_dict):
+        self.flownet.eval()
+        self.refinenet.eval()
+
         phi_prev_list = cond_dict['phi_prev_list']
         phi_next_list = cond_dict['phi_next_list']
         frame_prev = cond_dict['frame_prev']
         frame_next = cond_dict['frame_next']
+
+        back = False
+        if frame_prev.min() < 0:
+            back = True
+            frame_prev = frame_prev/2 + 0.5
+            frame_next = frame_next/2 + 0.5
 
         #assert z.shape[1:] == self.z_shape[1:]
         self.last_z_shape = z.shape
 
         # timestep embedding
         temb = None
+
+        B, _, H, W = frame_prev.size()
+        imgs = torch.cat((frame_prev, frame_next), 1)
+
+        flow, flow_list = self.flownet(imgs)
+        flow, c0, c1 = self.refinenet(frame_prev, frame_next, flow) ## flow and warped features of refined flows, 1, 1/2,1/4,1/8
+        warped_img0 = warp(frame_prev, flow[:, :2])
+        warped_img1 = warp(frame_next, flow[:, 2:])
+        
+        phi_prev_list = self.refinenet.warp_fea(phi_prev_list,flow[:, :2])
+        phi_next_list = self.refinenet.warp_fea(phi_next_list,flow[:,2:4])## warping features
 
         # z to block_in
         h = self.conv_in(z)
@@ -557,19 +554,243 @@ class FlowDecoderWithResidual(nn.Module):
 
         h = self.norm_out(h)
         h = nonlinearity(h)
-        h = self.conv_out(h)
-        alpha1 = self.moduleAlpha1(h)
-        alpha2 = self.moduleAlpha2(h)
-        beta1 = self.moduleBeta1(h)
-        beta2 = self.moduleBeta2(h)
-        v1 = self.moduleKernelVertical1(h)
-        v2 = self.moduleKernelVertical2(h)
-        h1 = self.moduleKernelHorizontal1(h)
-        h2 = self.moduleKernelHorizontal2(h)
+        h = self.conv_out(h) 
+
         mask1 = self.moduleMask(h)
         mask2 = 1.0 - mask1
-        warped1 = dsepconv.FunctionDSepconv(self.modulePad(frame_prev), v1, h1, alpha1, beta1, mask1)
-        warped2 = dsepconv.FunctionDSepconv(self.modulePad(frame_next), v2, h2, alpha2, beta2, mask2)
-        warped = warped1 + warped2
-        out = warped + self.moduleResidual(h)
+        res = self.moduleResidual(h)
+        res = res*2 - 1 ## -1,1
+        out = warped_img0*mask1 + warped_img1*mask2 + res
+        if back:
+            out = out.clamp_(min = 0, max = 1)
+            out = out*2 - 1 ## -1,1
+        else:
+            out = out.clamp_(min=-1,max = 1)
         return out
+
+
+
+# old FlowDecoderWithResidual. changed according to intructions in readme file here: 
+# https://github.com/ZonglinL/ConsecutiveBrownianBridge
+# class FlowDecoderWithResidual(nn.Module):
+#     def __init__(self, *, ch, out_ch, ch_mult=(1,2,4,8), num_res_blocks,
+#                  attn_resolutions, dropout=0.0, resamp_with_conv=True, in_channels,
+#                  resolution, z_channels, give_pre_end=False, tanh_out=False, use_linear_attn=False,
+#                  attn_type="vanilla", num_head_channels=32, num_heads=1, cond_type=None,
+#                  **ignorekwargs):
+#         super().__init__()
+
+#         def KernelHead(c_in):
+#             return torch.nn.Sequential(
+#                     torch.nn.Conv2d(in_channels=c_in, out_channels=64, kernel_size=3, stride=1, padding=1),
+#                     torch.nn.ReLU(inplace=False),
+#                     torch.nn.Conv2d(in_channels=64, out_channels=32, kernel_size=3, stride=1, padding=1),
+#                     torch.nn.ReLU(inplace=False),
+#                     torch.nn.Conv2d(in_channels=32, out_channels=5, kernel_size=3, stride=1, padding=1),
+#                     torch.nn.ReLU(inplace=False),
+#                     # torch.nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True),
+#                     torch.nn.Conv2d(in_channels=5, out_channels=5, kernel_size=3, stride=1, padding=1)
+#                 )
+#         # end
+
+#         def OffsetHead(c_in):
+#             return torch.nn.Sequential(
+#                     torch.nn.Conv2d(in_channels=c_in, out_channels=64, kernel_size=3, stride=1, padding=1),
+#                     torch.nn.ReLU(inplace=False),
+#                     torch.nn.Conv2d(in_channels=64, out_channels=32, kernel_size=3, stride=1, padding=1),
+#                     torch.nn.ReLU(inplace=False),
+#                     torch.nn.Conv2d(in_channels=32, out_channels=5 ** 2, kernel_size=3, stride=1, padding=1),
+#                     torch.nn.ReLU(inplace=False),
+#                     # torch.nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True),
+#                     torch.nn.Conv2d(in_channels=5 ** 2, out_channels=5 ** 2, kernel_size=3, stride=1, padding=1)
+#                 )
+
+
+#         def MaskHead(c_in):
+#             return torch.nn.Sequential(
+#                     torch.nn.Conv2d(in_channels=c_in, out_channels=64, kernel_size=3, stride=1, padding=1),
+#                     torch.nn.ReLU(inplace=False),
+#                     torch.nn.Conv2d(in_channels=64, out_channels=32, kernel_size=3, stride=1, padding=1),
+#                     torch.nn.ReLU(inplace=False),
+#                     torch.nn.Conv2d(in_channels=32, out_channels=5 ** 2, kernel_size=3, stride=1, padding=1),
+#                     torch.nn.ReLU(inplace=False),
+#                     # torch.nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True),
+#                     torch.nn.Conv2d(in_channels=5 ** 2, out_channels=5 ** 2, kernel_size=3,
+#                              stride=1, padding=1),
+#                     torch.nn.Sigmoid()
+#                 )
+
+#         def ResidualHead(c_in):
+#             return torch.nn.Sequential(
+#                     torch.nn.Conv2d(in_channels=c_in, out_channels=64, kernel_size=3, stride=1, padding=1),
+#                     torch.nn.ReLU(inplace=False),
+#                     torch.nn.Conv2d(in_channels=64, out_channels=32, kernel_size=3, stride=1, padding=1),
+#                     torch.nn.ReLU(inplace=False),
+#                     torch.nn.Conv2d(in_channels=32, out_channels=3, kernel_size=3, stride=1, padding=1),
+#                     torch.nn.ReLU(inplace=False),
+#                     # torch.nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True),
+#                     torch.nn.Conv2d(in_channels=3, out_channels=3, kernel_size=3, stride=1, padding=1)
+#                 )
+        
+
+#         self.ch = ch # 128
+#         self.temb_ch = 0
+#         self.num_resolutions = len(ch_mult) # 3
+#         self.num_res_blocks = num_res_blocks # 2
+#         self.resolution = resolution # 256
+#         self.in_channels = in_channels # 3
+#         self.give_pre_end = give_pre_end # False
+#         self.tanh_out = tanh_out # False
+
+#         # compute in_ch_mult, block_in and curr_res at lowest res
+#         in_ch_mult = (1,)+tuple(ch_mult) # (1,1,2,4)
+#         block_in = int(ch*ch_mult[self.num_resolutions-1]) # 512
+#         curr_res = resolution // 2**(self.num_resolutions-1) # 64
+#         self.z_shape = (1,z_channels,curr_res,curr_res) # (1,3,64,64)
+#         print("Working with z of shape {} = {} dimensions.".format(
+#             self.z_shape, np.prod(self.z_shape)))
+
+#         # z to block_in
+#         self.conv_in = torch.nn.Conv2d(z_channels,
+#                                        block_in,
+#                                        kernel_size=3,
+#                                        stride=1,
+#                                        padding=1)
+
+#         # middle
+#         self.mid = nn.Module()
+#         self.mid.block_1 = ResnetBlock(in_channels=block_in,
+#                                        out_channels=block_in,
+#                                        temb_channels=self.temb_ch,
+#                                        dropout=dropout)
+#         self.mid.attn_1 = make_attn(block_in, attn_type=attn_type)
+#         self.mid.block_2 = ResnetBlock(in_channels=block_in,
+#                                        out_channels=block_in,
+#                                        temb_channels=self.temb_ch,
+#                                        dropout=dropout)
+
+#         # upsampling
+#         self.up = nn.ModuleList()
+#         for i_level in reversed(range(self.num_resolutions)): # 2,1,0
+#             block = nn.ModuleList()
+#             attn = nn.ModuleList()
+#             block_out = int(ch*ch_mult[i_level])
+#             # ResBlocks
+#             for i_block in range(self.num_res_blocks):
+#                 block.append(ResnetBlock(in_channels=block_in,
+#                                          out_channels=block_out,
+#                                          temb_channels=self.temb_ch,
+#                                          dropout=dropout))
+#                 block_in = block_out
+#                 if curr_res in attn_resolutions:
+#                     attn.append(make_attn(block_in, attn_type=attn_type))
+
+#             # CrossAttention
+#             if num_head_channels == -1:
+#                 dim_head = block_in // num_heads
+#             else:
+#                 num_heads = block_in // num_head_channels
+#                 dim_head = num_head_channels # 32
+#             if cond_type == 'cross_attn':
+#                 cross_attn = SpatialCrossAttentionWithPosEmb(in_channels=block_in, 
+#                                                              heads=num_heads,
+#                                                              dim_head=dim_head)
+#             elif cond_type == 'max_cross_attn':
+#                 cross_attn = SpatialCrossAttentionWithMax(in_channels=block_in,
+#                                                           heads=num_heads,
+#                                                           dim_head=dim_head)
+#             elif cond_type == 'max_cross_attn_frame':
+#                 cross_attn = SpatialCrossAttentionWithMax(in_channels=block_in,
+#                                                           heads=num_heads,
+#                                                           dim_head=dim_head,
+#                                                           ctx_dim=6)
+#             else:
+#                 cross_attn = IdentityWrapper()
+
+#             up = nn.Module()
+#             up.block = block
+#             up.attn = attn
+#             up.cross_attn = cross_attn
+
+#             # Upsample
+#             # if i_level != self.num_resolutions-1: ## THIS IS ORIGINAL CODE
+#             # if i_level != 0:
+#             up.upsample = Upsample(block_in, resamp_with_conv)
+#             curr_res = curr_res * 2
+#             self.up.insert(0, up) # prepend to get consistent order
+
+#         # end
+#         self.norm_out = Normalize(block_in)
+#         self.conv_out = torch.nn.Conv2d(block_in,
+#                                         block_in,
+#                                         kernel_size=3,
+#                                         stride=1,
+#                                         padding=1)
+#         self.moduleAlpha1 = OffsetHead(c_in=block_in)
+#         self.moduleAlpha2 = OffsetHead(c_in=block_in)
+#         self.moduleBeta1 = OffsetHead(c_in=block_in)
+#         self.moduleBeta2 = OffsetHead(c_in=block_in)
+#         self.moduleKernelHorizontal1 = KernelHead(c_in=block_in)
+#         self.moduleKernelHorizontal2 = KernelHead(c_in=block_in)
+#         self.moduleKernelVertical1 = KernelHead(c_in=block_in)
+#         self.moduleKernelVertical2 = KernelHead(c_in=block_in)
+#         self.moduleMask = MaskHead(c_in=block_in)
+#         self.moduleResidual = ResidualHead(c_in=block_in)
+#         self.modulePad = torch.nn.ReplicationPad2d([2, 2, 2, 2])
+
+#     def forward(self, z, cond_dict):
+#         phi_prev_list = cond_dict['phi_prev_list']
+#         phi_next_list = cond_dict['phi_next_list']
+#         frame_prev = cond_dict['frame_prev']
+#         frame_next = cond_dict['frame_next']
+
+#         #assert z.shape[1:] == self.z_shape[1:]
+#         self.last_z_shape = z.shape
+
+#         # timestep embedding
+#         temb = None
+
+#         # z to block_in
+#         h = self.conv_in(z)
+
+#         # middle
+#         h = self.mid.block_1(h, temb)
+#         h = self.mid.attn_1(h)
+#         h = self.mid.block_2(h, temb)
+
+#         # upsampling
+#         for i_level in reversed(range(self.num_resolutions)): # [2,1,0]
+#             for i_block in range(self.num_res_blocks):
+#                 h = self.up[i_level].block[i_block](h, temb)
+#                 if len(self.up[i_level].attn) > 0:
+#                     h = self.up[i_level].attn[i_block](h)
+#             ctx = None
+#             if phi_prev_list[i_level] is not None:
+#                 ctx = torch.cat([phi_prev_list[i_level], phi_next_list[i_level]], dim=1)
+#             h = self.up[i_level].cross_attn(h, ctx)
+#             # if i_level != self.num_resolutions-1:
+#             # if i_level != 0:
+#             h = self.up[i_level].upsample(h)
+
+#         # end
+#         if self.give_pre_end:
+#             return h
+
+#         h = self.norm_out(h)
+#         h = nonlinearity(h)
+#         h = self.conv_out(h)
+#         alpha1 = self.moduleAlpha1(h)
+#         alpha2 = self.moduleAlpha2(h)
+#         beta1 = self.moduleBeta1(h)
+#         beta2 = self.moduleBeta2(h)
+#         v1 = self.moduleKernelVertical1(h)
+#         v2 = self.moduleKernelVertical2(h)
+#         h1 = self.moduleKernelHorizontal1(h)
+#         h2 = self.moduleKernelHorizontal2(h)
+#         mask1 = self.moduleMask(h)
+#         mask2 = 1.0 - mask1
+#         warped1 = dsepconv.FunctionDSepconv(self.modulePad(frame_prev), v1, h1, alpha1, beta1, mask1)
+#         warped2 = dsepconv.FunctionDSepconv(self.modulePad(frame_next), v2, h2, alpha2, beta2, mask2)
+#         warped = warped1 + warped2
+#         out = warped + self.moduleResidual(h)
+#         return out
