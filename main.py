@@ -193,7 +193,7 @@ class DataModuleFromConfig(pl.LightningDataModule):
             init_fn = None
         return DataLoader(self.datasets["train"], batch_size=self.batch_size,
                           num_workers=self.num_workers, shuffle=True,
-                          worker_init_fn=init_fn)
+                          worker_init_fn=init_fn, persistent_workers=True, pin_memory=True)
 
     def _val_dataloader(self, shuffle=False):
         if self.use_worker_init_fn:
@@ -204,7 +204,7 @@ class DataModuleFromConfig(pl.LightningDataModule):
                           batch_size=self.batch_size,
                           num_workers=self.num_workers,
                           worker_init_fn=init_fn,
-                          shuffle=shuffle)
+                          shuffle=shuffle, persistent_workers=True, pin_memory=True)
 
     def _test_dataloader(self, shuffle=False):
         if self.use_worker_init_fn:
@@ -213,7 +213,7 @@ class DataModuleFromConfig(pl.LightningDataModule):
             init_fn = None
 
         return DataLoader(self.datasets["test"], batch_size=self.batch_size,
-                          num_workers=self.num_workers, worker_init_fn=init_fn, shuffle=shuffle)
+                          num_workers=self.num_workers, worker_init_fn=init_fn, shuffle=shuffle, persistent_workers=True, pin_memory=True)
 
     def _predict_dataloader(self, shuffle=False):
         if self.use_worker_init_fn:
@@ -221,7 +221,7 @@ class DataModuleFromConfig(pl.LightningDataModule):
         else:
             init_fn = None
         return DataLoader(self.datasets["predict"], batch_size=self.batch_size,
-                          num_workers=self.num_workers, worker_init_fn=init_fn)
+                          num_workers=self.num_workers, worker_init_fn=init_fn, persistent_workers=True, pin_memory=True)
 
 
 class SetupCallback(Callback):
@@ -404,7 +404,7 @@ class ImageLogger(Callback):
     def on_validation_epoch_end(self, trainer, pl_module):
         if len(self.val_psnr_epoch) > 0:
             epoch_psnr = torch.cat(self.val_psnr_epoch).mean().item()
-            pl_module.log_dict({'val/psnr':epoch_psnr}, prog_bar=False, logger=True, on_step=False, on_epoch=True)
+            pl_module.log_dict({'val/psnr':epoch_psnr}, prog_bar=False, logger=True, on_step=False, on_epoch=True, sync_dist=True)
             self.val_psnr_epoch = []
 
 class CUDACallback(Callback):
@@ -639,7 +639,6 @@ if __name__ == "__main__":
             del callbacks_cfg['ignore_keys_callback']
 
         trainer_kwargs["callbacks"] = [instantiate_from_config(callbacks_cfg[k]) for k in callbacks_cfg]
-
         trainer = Trainer.from_argparse_args(trainer_opt, **trainer_kwargs)
         trainer.logdir = logdir  ###
 
