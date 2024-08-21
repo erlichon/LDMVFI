@@ -10,3 +10,4 @@ logs/*
 eval_results*
 *.idea*
 *.pytorch
+results/*
