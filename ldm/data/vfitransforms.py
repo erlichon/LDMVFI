@@ -5,10 +5,6 @@ import torchvision.transforms.functional as TF
 
 
 def rand_crop(*args, sz):
-    # import pdb; pdb.set_trace()
-    # if args[0].size == (1024, 1024):
-    #     for i in range(len(args)):
-    #         args[i] = TF.resize(args[i], (512, 512))
     i, j, h, w = torchvision.transforms.RandomCrop.get_params(args[0], output_size=sz)
     out = []
     for im in args:
