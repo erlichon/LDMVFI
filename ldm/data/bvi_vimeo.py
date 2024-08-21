@@ -46,16 +46,6 @@ class Vimeo90k_triplet(Dataset):
         to_array = partial(np.array, dtype=np.float32)
         frame3, frame4, frame5 = map(to_array, (rawFrame3, rawFrame4, rawFrame5)) #(256,256,3), 0-255
         
-        
-        if self.train:
-            if np.random.rand() < 0.75:
-                rot_option = np.random.randint(0,4)
-                frame3 = np.rot90(frame3,rot_option)
-                frame4 = np.rot90(frame4,rot_option)
-                frame5 = np.rot90(frame5,rot_option)
-
-
-
         frame3 = frame3/127.5 - 1.0
         frame4 = frame4/127.5 - 1.0
         frame5 = frame5/127.5 - 1.0
